@@ -248,10 +248,20 @@ axis_options = [
 ]
 
 
+def clean_annotation(str):
+    # remove path names from files. don't use os.path.basename because
+    # we get things other than model names here, and we don't want to blow
+    # them up too bad
+    i = str.rfind("\\")
+    if i >= 0:
+        return str[i+1:]
+    else:
+        return str
+       
 def draw_xyz_grid(p, xs, ys, zs, x_labels, y_labels, z_labels, cell, draw_legend, include_lone_images, include_sub_grids, first_axes_processed, second_axes_processed, margin_size):
-    hor_texts = [[images.GridAnnotation(x)] for x in x_labels]
-    ver_texts = [[images.GridAnnotation(y)] for y in y_labels]
-    title_texts = [[images.GridAnnotation(z)] for z in z_labels]
+    hor_texts   = [[images.GridAnnotation(clean_annotation(x))] for x in x_labels]
+    ver_texts   = [[images.GridAnnotation(clean_annotation(y))] for y in y_labels]
+    title_texts = [[images.GridAnnotation(clean_annotation(z))] for z in z_labels]
 
     list_size = (len(xs) * len(ys) * len(zs))
 
