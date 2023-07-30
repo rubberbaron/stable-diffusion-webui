@@ -672,7 +672,7 @@ class Script(scripts.Script):
                pc.seed += ix
             if vary_seeds_y:
                pc.seed += iy * xdim
-            if vary_seed_z:
+            if vary_seeds_z:
                pc.seed += iz * xdim * ydim
 
             res = process_images(pc)
