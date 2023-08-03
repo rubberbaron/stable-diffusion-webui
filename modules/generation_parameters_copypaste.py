@@ -50,7 +50,6 @@ def unquote(text):
     except Exception:
         return text
 
-
 def image_from_url_text(filedata):
     if filedata is None:
         return None
@@ -217,6 +216,11 @@ Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 965400086, Size: 512x512, Model
 
     returns a dict with field values
     """
+
+    # patch up old info that had Wildcard with newlines
+    pos = x.rfind('Wildcard prompt: "')
+    if pos > 0:
+        x = x[0:pos] + x[pos:].replace("\n", " ")
 
     res = {}
 

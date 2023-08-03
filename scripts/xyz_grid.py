@@ -251,10 +251,20 @@ axis_options = [
 ]
 
 
+def clean_annotation(str):
+    # remove path names from files. don't use os.path.basename because
+    # we get things other than model names here, and we don't want to blow
+    # them up too bad
+    i = str.rfind("\\")
+    if i >= 0:
+        return str[i+1:]
+    else:
+        return str
+       
 def draw_xyz_grid(p, xs, ys, zs, x_labels, y_labels, z_labels, cell, draw_legend, include_lone_images, include_sub_grids, first_axes_processed, second_axes_processed, margin_size):
-    hor_texts = [[images.GridAnnotation(x)] for x in x_labels]
-    ver_texts = [[images.GridAnnotation(y)] for y in y_labels]
-    title_texts = [[images.GridAnnotation(z)] for z in z_labels]
+    hor_texts   = [[images.GridAnnotation(clean_annotation(x))] for x in x_labels]
+    ver_texts   = [[images.GridAnnotation(clean_annotation(y))] for y in y_labels]
+    title_texts = [[images.GridAnnotation(clean_annotation(z))] for z in z_labels]
 
     list_size = (len(xs) * len(ys) * len(zs))
 
@@ -420,6 +430,10 @@ class Script(scripts.Script):
                 include_lone_images = gr.Checkbox(label='Include Sub Images', value=False, elem_id=self.elem_id("include_lone_images"))
                 include_sub_grids = gr.Checkbox(label='Include Sub Grids', value=False, elem_id=self.elem_id("include_sub_grids"))
             with gr.Column():
+                vary_seeds_x = gr.Checkbox(label='Vary seed on X axis', value=False, elem_id=self.elem_id("vary_seeds_x"))
+                vary_seeds_y = gr.Checkbox(label='Vary seed on Y axis', value=False, elem_id=self.elem_id("vary_seeds_y"))
+                vary_seeds_z = gr.Checkbox(label='Vary seed on Z axis', value=False, elem_id=self.elem_id("vary_seeds_z"))
+            with gr.Column():
                 margin_size = gr.Slider(label="Grid margins (px)", minimum=0, maximum=500, value=0, step=2, elem_id=self.elem_id("margin_size"))
 
         with gr.Row(variant="compact", elem_id="swap_axes"):
@@ -478,9 +492,9 @@ class Script(scripts.Script):
             (z_values_dropdown, lambda params:get_dropdown_update_from_params("Z",params)),
         )
 
-        return [x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, margin_size]
+        return [x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, vary_seeds_x, vary_seeds_y, vary_seeds_z, margin_size]
 
-    def run(self, p, x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, margin_size):
+    def run(self, p, x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, vary_seeds_x, vary_seeds_y, vary_seeds_z, margin_size):
         if not no_fixed_seeds:
             modules.processing.fix_seed(p)
 
@@ -650,6 +664,16 @@ class Script(scripts.Script):
             x_opt.apply(pc, x, xs)
             y_opt.apply(pc, y, ys)
             z_opt.apply(pc, z, zs)
+
+            xdim = len(xs) if vary_seeds_x else 1
+            ydim = len(ys) if vary_seeds_y else 1
+
+            if vary_seeds_x:
+               pc.seed += ix
+            if vary_seeds_y:
+               pc.seed += iy * xdim
+            if vary_seeds_z:
+               pc.seed += iz * xdim * ydim
 
             try:
                 res = process_images(pc)
