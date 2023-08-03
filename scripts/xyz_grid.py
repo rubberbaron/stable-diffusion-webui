@@ -260,7 +260,7 @@ def clean_annotation(str):
         return str[i+1:]
     else:
         return str
-       
+
 def draw_xyz_grid(p, xs, ys, zs, x_labels, y_labels, z_labels, cell, draw_legend, include_lone_images, include_sub_grids, first_axes_processed, second_axes_processed, margin_size):
     hor_texts   = [[images.GridAnnotation(clean_annotation(x))] for x in x_labels]
     ver_texts   = [[images.GridAnnotation(clean_annotation(y))] for y in y_labels]
