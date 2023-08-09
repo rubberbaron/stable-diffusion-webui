@@ -349,7 +349,7 @@ class StableDiffusionProcessing:
         caches is a list with items described above.
         """
 
-        cached_params = self.cached_params(required_prompts, steps, hires_steps, extra_network_data, shared.opts.use_old_schedule_syntax)
+        cached_params = self.cached_params(required_prompts, steps, hires_steps, extra_network_data, shared.opts.use_old_scheduling)
 
         for cache in caches:
             if cache[0] is not None and cached_params == cache[0]:
@@ -358,7 +358,7 @@ class StableDiffusionProcessing:
         cache = caches[0]
 
         with devices.autocast():
-            cache[1] = function(shared.sd_model, required_prompts, steps, hires_steps, shared.opts.use_old_schedule_syntax)
+            cache[1] = function(shared.sd_model, required_prompts, steps, hires_steps, shared.opts.use_old_scheduling)
 
         cache[0] = cached_params
         return cache[1]
