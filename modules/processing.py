@@ -867,7 +867,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 image = apply_overlay(image, p.paste_to, i, p.overlay_images)
 
                 if save_samples:
-                    images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p)
+                    images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, extra_params=(p.extra_generation_params, n * p.batch_size + i))
 
                 text = infotext(i)
                 infotexts.append(text)

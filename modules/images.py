@@ -376,6 +376,7 @@ class FilenameGenerator:
         'batch_size': lambda self: self.p.batch_size,
         'generation_number': lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if (self.p.n_iter == 1 and self.p.batch_size == 1) or self.zip else self.p.iteration * self.p.batch_size + self.p.batch_index + 1,
         'hasprompt': lambda self, *args: self.hasprompt(*args),  # accepts formats:[hasprompt<prompt1|default><prompt2>..]
+        'hasextra': lambda self, *args: self.hasextra(*args),  # accepts format:[hasextra<extra1|default><extra2>..]
         'clip_skip': lambda self: opts.data["CLIP_stop_at_last_layers"],
         'denoising': lambda self: self.p.denoising_strength if self.p and self.p.denoising_strength else NOTHING_AND_SKIP_PREVIOUS_TEXT,
         'user': lambda self: self.p.user,
@@ -384,12 +385,14 @@ class FilenameGenerator:
     }
     default_time_format = '%Y%m%d%H%M%S'
 
-    def __init__(self, p, seed, prompt, image, zip=False):
+    def __init__(self, p, seed, prompt, image, zip=False, extra=None):
         self.p = p
         self.seed = seed
         self.prompt = prompt
         self.image = image
         self.zip = zip
+        self.extra_dict = None if extra is None else extra[0]
+        self.extra_index = None if extra is None else extra[1]
 
     def hasprompt(self, *args):
         lower = self.prompt.lower()
@@ -405,6 +408,25 @@ class FilenameGenerator:
                     outres = f'{outres}{expected}'
                 else:
                     outres = outres if default == "" else f'{outres}{default}'
+        return sanitize_filename_part(outres)
+
+    def hasextra(self, *args):
+        if self.p is None or self.extra_dict is None:
+            return None
+        outres = ""
+        for arg in args:
+            if arg != "":
+                division = arg.split("|")
+                key = division[0].lower()
+                default = division[1] if len(division) > 1 else ""
+                if key in self.extra_dict:
+                    value = self.extra_dict[key]
+                    if isinstance(value,list) and self.extra_index < len(value):
+                        outres += str(value[self.extra_index])
+                    else:
+                        outres += str(value)
+                else:
+                    outres += default
         return sanitize_filename_part(outres)
 
     def prompt_no_style(self):
@@ -550,7 +572,7 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
         image.save(filename, format=image_format, quality=opts.jpeg_quality)
 
 
-def save_image(image, path, basename, seed=None, prompt=None, extension='png', info=None, short_filename=False, no_prompt=False, grid=False, pnginfo_section_name='parameters', p=None, existing_info=None, forced_filename=None, suffix="", save_to_dirs=None):
+def save_image(image, path, basename, seed=None, prompt=None, extension='png', info=None, short_filename=False, no_prompt=False, grid=False, pnginfo_section_name='parameters', p=None, existing_info=None, forced_filename=None, suffix="", save_to_dirs=None, extra_params=None):
     """Save an image.
 
     Args:
@@ -576,6 +598,8 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
             If specified, `basename` and filename pattern will be ignored.
         save_to_dirs (bool):
             If true, the image will be saved into a subdirectory of `path`.
+        extra_info((dict,int)):
+            extra generation parameters dictionary and index within arrays of image for filename customization with hasextra
 
     Returns: (fullfn, txt_fullfn)
         fullfn (`str`):
@@ -583,7 +607,7 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
         txt_fullfn (`str` or None):
             If a text file is saved for this image, this will be its full path. Otherwise None.
     """
-    namegen = FilenameGenerator(p, seed, prompt, image)
+    namegen = FilenameGenerator(p, seed, prompt, image, extra=extra_params)
 
     if save_to_dirs is None:
         save_to_dirs = (grid and opts.grid_save_to_dirs) or (not grid and opts.save_to_dirs and not no_prompt)
