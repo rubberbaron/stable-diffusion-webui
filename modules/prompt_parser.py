@@ -107,7 +107,7 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                 yield args[(step - 1) % len(args)]
             def start(self, args):
                 def flatten(x):
-                    if type(x) == str:
+                    if isinstance(x, str):
                         yield x
                     else:
                         for gen in x:

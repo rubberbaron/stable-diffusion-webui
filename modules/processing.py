@@ -1,9 +1,11 @@
+from __future__ import annotations
 import json
 import logging
 import math
 import os
 import sys
 import hashlib
+from dataclasses import dataclass, field
 
 import torch
 import numpy as np
@@ -11,7 +13,7 @@ from PIL import Image, ImageOps
 import random
 import cv2
 from skimage import exposure
-from typing import Any, Dict, List
+from typing import Any
 
 import modules.sd_hijack
 from modules import devices, prompt_parser, masking, sd_samplers, lowvram, generation_parameters_copypaste, extra_networks, sd_vae_approx, scripts, sd_samplers_common, sd_unet, errors, rng
@@ -57,7 +59,7 @@ def apply_color_correction(correction, original_image):
 
     image = blendLayers(image, original_image, BlendType.LUMINOSITY)
 
-    return image
+    return image.convert('RGB')
 
 
 def apply_overlay(image, paste_loc, index, overlays):
@@ -79,6 +81,12 @@ def apply_overlay(image, paste_loc, index, overlays):
 
     return image
 
+def create_binary_mask(image):
+    if image.mode == 'RGBA' and image.getextrema()[-1] != (255, 255):
+        image = image.split()[-1].convert("L").point(lambda x: 255 if x > 128 else 0)
+    else:
+        image = image.convert('L')
+    return image
 
 def txt2img_image_conditioning(sd_model, x, width, height):
     if sd_model.model.conditioning_key in {'hybrid', 'concat'}: # Inpainting models
@@ -104,96 +112,164 @@ def txt2img_image_conditioning(sd_model, x, width, height):
         return x.new_zeros(x.shape[0], 5, 1, 1, dtype=x.dtype, device=x.device)
 
 
+@dataclass(repr=False)
 class StableDiffusionProcessing:
-    """
-    The first set of paramaters: sd_models -> do_not_reload_embeddings represent the minimum required to create a StableDiffusionProcessing
-    """
+    sd_model: object = None
+    outpath_samples: str = None
+    outpath_grids: str = None
+    prompt: str = ""
+    prompt_for_display: str = None
+    negative_prompt: str = ""
+    styles: list[str] = None
+    seed: int = -1
+    subseed: int = -1
+    subseed_strength: float = 0
+    seed_resize_from_h: int = -1
+    seed_resize_from_w: int = -1
+    seed_enable_extras: bool = True
+    sampler_name: str = None
+    batch_size: int = 1
+    n_iter: int = 1
+    steps: int = 50
+    cfg_scale: float = 7.0
+    width: int = 512
+    height: int = 512
+    restore_faces: bool = None
+    tiling: bool = None
+    do_not_save_samples: bool = False
+    do_not_save_grid: bool = False
+    extra_generation_params: dict[str, Any] = None
+    overlay_images: list = None
+    eta: float = None
+    do_not_reload_embeddings: bool = False
+    denoising_strength: float = 0
+    ddim_discretize: str = None
+    s_min_uncond: float = None
+    s_churn: float = None
+    s_tmax: float = None
+    s_tmin: float = None
+    s_noise: float = None
+    override_settings: dict[str, Any] = None
+    override_settings_restore_afterwards: bool = True
+    sampler_index: int = None
+    refiner_checkpoint: str = None
+    refiner_switch_at: float = None
+    token_merging_ratio = 0
+    token_merging_ratio_hr = 0
+    disable_extra_networks: bool = False
+
+    scripts_value: scripts.ScriptRunner = field(default=None, init=False)
+    script_args_value: list = field(default=None, init=False)
+    scripts_setup_complete: bool = field(default=False, init=False)
+
     cached_uc = [None, None]
     cached_c = [None, None]
 
-    def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt: str = "", styles: List[str] = None, seed: int = -1, subseed: int = -1, subseed_strength: float = 0, seed_resize_from_h: int = -1, seed_resize_from_w: int = -1, seed_enable_extras: bool = True, sampler_name: str = None, batch_size: int = 1, n_iter: int = 1, steps: int = 50, cfg_scale: float = 7.0, width: int = 512, height: int = 512, restore_faces: bool = None, tiling: bool = None, do_not_save_samples: bool = False, do_not_save_grid: bool = False, extra_generation_params: Dict[Any, Any] = None, overlay_images: Any = None, negative_prompt: str = None, eta: float = None, do_not_reload_embeddings: bool = False, denoising_strength: float = 0, ddim_discretize: str = None, s_min_uncond: float = 0.0, s_churn: float = 0.0, s_tmax: float = None, s_tmin: float = 0.0, s_noise: float = None, override_settings: Dict[str, Any] = None, override_settings_restore_afterwards: bool = True, sampler_index: int = None, script_args: list = None):
-        if sampler_index is not None:
+    comments: dict = None
+    sampler: sd_samplers_common.Sampler | None = field(default=None, init=False)
+    is_using_inpainting_conditioning: bool = field(default=False, init=False)
+    paste_to: tuple | None = field(default=None, init=False)
+
+    is_hr_pass: bool = field(default=False, init=False)
+
+    c: tuple = field(default=None, init=False)
+    uc: tuple = field(default=None, init=False)
+
+    rng: rng.ImageRNG | None = field(default=None, init=False)
+    step_multiplier: int = field(default=1, init=False)
+    color_corrections: list = field(default=None, init=False)
+
+    all_prompts: list = field(default=None, init=False)
+    all_negative_prompts: list = field(default=None, init=False)
+    all_seeds: list = field(default=None, init=False)
+    all_subseeds: list = field(default=None, init=False)
+    iteration: int = field(default=0, init=False)
+    main_prompt: str = field(default=None, init=False)
+    main_negative_prompt: str = field(default=None, init=False)
+
+    prompts: list = field(default=None, init=False)
+    negative_prompts: list = field(default=None, init=False)
+    seeds: list = field(default=None, init=False)
+    subseeds: list = field(default=None, init=False)
+    extra_network_data: dict = field(default=None, init=False)
+
+    user: str = field(default=None, init=False)
+
+    sd_model_name: str = field(default=None, init=False)
+    sd_model_hash: str = field(default=None, init=False)
+    sd_vae_name: str = field(default=None, init=False)
+    sd_vae_hash: str = field(default=None, init=False)
+
+    is_api: bool = field(default=False, init=False)
+
+    def __post_init__(self):
+        if self.sampler_index is not None:
             print("sampler_index argument for StableDiffusionProcessing does not do anything; use sampler_name", file=sys.stderr)
 
-        self.outpath_samples: str = outpath_samples
-        self.outpath_grids: str = outpath_grids
-        self.prompt: str = prompt
-        self.prompt_for_display: str = None
-        self.negative_prompt: str = (negative_prompt or "")
-        self.styles: list = styles or []
-        self.seed: int = seed
-        self.subseed: int = subseed
-        self.subseed_strength: float = subseed_strength
-        self.seed_resize_from_h: int = seed_resize_from_h
-        self.seed_resize_from_w: int = seed_resize_from_w
-        self.sampler_name: str = sampler_name
-        self.batch_size: int = batch_size
-        self.n_iter: int = n_iter
-        self.steps: int = steps
-        self.cfg_scale: float = cfg_scale
-        self.width: int = width
-        self.height: int = height
-        self.restore_faces: bool = restore_faces
-        self.tiling: bool = tiling
-        self.do_not_save_samples: bool = do_not_save_samples
-        self.do_not_save_grid: bool = do_not_save_grid
-        self.extra_generation_params: dict = extra_generation_params or {}
-        self.overlay_images = overlay_images
-        self.eta = eta
-        self.do_not_reload_embeddings = do_not_reload_embeddings
-        self.paste_to = None
-        self.color_corrections = None
-        self.denoising_strength: float = denoising_strength
-        self.sampler_noise_scheduler_override = None
-        self.ddim_discretize = ddim_discretize or opts.ddim_discretize
-        self.s_min_uncond = s_min_uncond or opts.s_min_uncond
-        self.s_churn = s_churn or opts.s_churn
-        self.s_tmin = s_tmin or opts.s_tmin
-        self.s_tmax = (s_tmax if s_tmax is not None else opts.s_tmax) or float('inf')
-        self.s_noise = s_noise if s_noise is not None else opts.s_noise
-        self.override_settings = {k: v for k, v in (override_settings or {}).items() if k not in shared.restricted_opts}
-        self.override_settings_restore_afterwards = override_settings_restore_afterwards
-        self.is_using_inpainting_conditioning = False
-        self.disable_extra_networks = False
-        self.token_merging_ratio = 0
-        self.token_merging_ratio_hr = 0
+        self.comments = {}
 
-        if not seed_enable_extras:
+        if self.styles is None:
+            self.styles = []
+
+        self.sampler_noise_scheduler_override = None
+        self.s_min_uncond = self.s_min_uncond if self.s_min_uncond is not None else opts.s_min_uncond
+        self.s_churn = self.s_churn if self.s_churn is not None else opts.s_churn
+        self.s_tmin = self.s_tmin if self.s_tmin is not None else opts.s_tmin
+        self.s_tmax = (self.s_tmax if self.s_tmax is not None else opts.s_tmax) or float('inf')
+        self.s_noise = self.s_noise if self.s_noise is not None else opts.s_noise
+
+        self.extra_generation_params = self.extra_generation_params or {}
+        self.override_settings = self.override_settings or {}
+        self.script_args = self.script_args or {}
+
+        self.refiner_checkpoint_info = None
+
+        if not self.seed_enable_extras:
             self.subseed = -1
             self.subseed_strength = 0
             self.seed_resize_from_h = 0
             self.seed_resize_from_w = 0
 
-        self.scripts = None
-        self.script_args = script_args
-        self.all_prompts = None
-        self.all_negative_prompts = None
-        self.all_seeds = None
-        self.all_subseeds = None
-        self.iteration = 0
-        self.is_hr_pass = False
-        self.sampler = None
-        self.main_prompt = None
-        self.main_negative_prompt = None
-
-        self.prompts = None
-        self.negative_prompts = None
-        self.extra_network_data = None
-        self.seeds = None
-        self.subseeds = None
-
-        self.step_multiplier = 1
         self.cached_uc = StableDiffusionProcessing.cached_uc
         self.cached_c = StableDiffusionProcessing.cached_c
-        self.uc = None
-        self.c = None
-        self.rng: rng.ImageRNG = None
-
-        self.user = None
 
     @property
     def sd_model(self):
         return shared.sd_model
+
+    @sd_model.setter
+    def sd_model(self, value):
+        pass
+
+    @property
+    def scripts(self):
+        return self.scripts_value
+
+    @scripts.setter
+    def scripts(self, value):
+        self.scripts_value = value
+
+        if self.scripts_value and self.script_args_value and not self.scripts_setup_complete:
+            self.setup_scripts()
+
+    @property
+    def script_args(self):
+        return self.script_args_value
+
+    @script_args.setter
+    def script_args(self, value):
+        self.script_args_value = value
+
+        if self.scripts_value and self.script_args_value and not self.scripts_setup_complete:
+            self.setup_scripts()
+
+    def setup_scripts(self):
+        self.scripts_setup_complete = True
+
+        self.scripts.setup_scrips(self, is_ui=not self.is_api)
+
+    def comment(self, text):
+        self.comments[text] = 1
 
     def txt2img_image_conditioning(self, x, width=None, height=None):
         self.is_using_inpainting_conditioning = self.sd_model.model.conditioning_key in {'hybrid', 'concat'}
@@ -310,15 +386,20 @@ class StableDiffusionProcessing:
         return self.token_merging_ratio or opts.token_merging_ratio
 
     def setup_prompts(self):
-        if type(self.prompt) == list:
+        if isinstance(self.prompt,list):
             self.all_prompts = self.prompt
+        elif isinstance(self.negative_prompt, list):
+            self.all_prompts = [self.prompt] * len(self.negative_prompt)
         else:
             self.all_prompts = self.batch_size * self.n_iter * [self.prompt]
 
-        if type(self.negative_prompt) == list:
+        if isinstance(self.negative_prompt, list):
             self.all_negative_prompts = self.negative_prompt
         else:
-            self.all_negative_prompts = self.batch_size * self.n_iter * [self.negative_prompt]
+            self.all_negative_prompts = [self.negative_prompt] * len(self.all_prompts)
+
+        if len(self.all_prompts) != len(self.all_negative_prompts):
+            raise RuntimeError(f"Received a different number of prompts ({len(self.all_prompts)}) and negative prompts ({len(self.all_negative_prompts)})")
 
         self.all_prompts = [shared.prompt_styles.apply_styles_to_prompt(x, self.styles) for x in self.all_prompts]
         self.all_negative_prompts = [shared.prompt_styles.apply_negative_styles_to_prompt(x, self.styles) for x in self.all_negative_prompts]
@@ -326,7 +407,7 @@ class StableDiffusionProcessing:
         self.main_prompt = self.all_prompts[0]
         self.main_negative_prompt = self.all_negative_prompts[0]
 
-    def cached_params(self, required_prompts, steps, hires_steps, extra_network_data, use_old_scheduling):
+    def cached_params(self, required_prompts, steps, extra_network_data, hires_steps=None, use_old_scheduling=False):
         """Returns parameters that invalidate the cond cache if changed"""
 
         return (
@@ -343,7 +424,7 @@ class StableDiffusionProcessing:
             self.height,
         )
 
-    def get_conds_with_caching(self, function, required_prompts, steps, hires_steps, caches, extra_network_data):
+    def get_conds_with_caching(self, function, required_prompts, steps, caches, extra_network_data, hires_steps=None):
         """
         Returns the result of calling function(shared.sd_model, required_prompts, steps)
         using a cache to store the result if the same arguments have been used before.
@@ -356,7 +437,13 @@ class StableDiffusionProcessing:
         caches is a list with items described above.
         """
 
-        cached_params = self.cached_params(required_prompts, steps, hires_steps, extra_network_data, shared.opts.use_old_scheduling)
+        if shared.opts.use_old_scheduling:
+            old_schedules = prompt_parser.get_learned_conditioning_prompt_schedules(required_prompts, steps, hires_steps, False)
+            new_schedules = prompt_parser.get_learned_conditioning_prompt_schedules(required_prompts, steps, hires_steps, True)
+            if old_schedules != new_schedules:
+                self.extra_generation_params["Old prompt editing timelines"] = True
+
+        cached_params = self.cached_params(required_prompts, steps, extra_network_data, hires_steps, shared.opts.use_old_scheduling)
 
         for cache in caches:
             if cache[0] is not None and cached_params == cache[0]:
@@ -375,10 +462,12 @@ class StableDiffusionProcessing:
         negative_prompts = prompt_parser.SdConditioning(self.negative_prompts, width=self.width, height=self.height, is_negative_prompt=True)
 
         sampler_config = sd_samplers.find_sampler_config(self.sampler_name)
-        self.step_multiplier = 2 if sampler_config and sampler_config.options.get("second_order", False) else 1
-        self.firstpass_steps = self.steps * self.step_multiplier
-        self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, self.firstpass_steps, None, [self.cached_uc], self.extra_network_data)
-        self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, self.firstpass_steps, None, [self.cached_c], self.extra_network_data)
+        total_steps = sampler_config.total_steps(self.steps) if sampler_config else self.steps
+        self.step_multiplier = total_steps // self.steps
+        self.firstpass_steps = total_steps
+
+        self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, total_steps, [self.cached_uc], self.extra_network_data)
+        self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, total_steps, [self.cached_c], self.extra_network_data)
 
     def get_conds(self):
         return self.c, self.uc
@@ -400,7 +489,7 @@ class Processed:
         self.subseed = subseed
         self.subseed_strength = p.subseed_strength
         self.info = info
-        self.comments = comments
+        self.comments = "".join(f"{comment}\n" for comment in p.comments)
         self.width = p.width
         self.height = p.height
         self.sampler_name = p.sampler_name
@@ -410,7 +499,10 @@ class Processed:
         self.batch_size = p.batch_size
         self.restore_faces = p.restore_faces
         self.face_restoration_model = opts.face_restoration_model if p.restore_faces else None
-        self.sd_model_hash = shared.sd_model.sd_model_hash
+        self.sd_model_name = p.sd_model_name
+        self.sd_model_hash = p.sd_model_hash
+        self.sd_vae_name = p.sd_vae_name
+        self.sd_vae_hash = p.sd_vae_hash
         self.seed_resize_from_w = p.seed_resize_from_w
         self.seed_resize_from_h = p.seed_resize_from_h
         self.denoising_strength = getattr(p, 'denoising_strength', None)
@@ -430,10 +522,10 @@ class Processed:
         self.s_noise = p.s_noise
         self.s_min_uncond = p.s_min_uncond
         self.sampler_noise_scheduler_override = p.sampler_noise_scheduler_override
-        self.prompt = self.prompt if type(self.prompt) != list else self.prompt[0]
-        self.negative_prompt = self.negative_prompt if type(self.negative_prompt) != list else self.negative_prompt[0]
-        self.seed = int(self.seed if type(self.seed) != list else self.seed[0]) if self.seed is not None else -1
-        self.subseed = int(self.subseed if type(self.subseed) != list else self.subseed[0]) if self.subseed is not None else -1
+        self.prompt = self.prompt if not isinstance(self.prompt, list) else self.prompt[0]
+        self.negative_prompt = self.negative_prompt if not isinstance(self.negative_prompt, list) else self.negative_prompt[0]
+        self.seed = int(self.seed if not isinstance(self.seed, list) else self.seed[0]) if self.seed is not None else -1
+        self.subseed = int(self.subseed if not isinstance(self.subseed, list) else self.subseed[0]) if self.subseed is not None else -1
         self.is_using_inpainting_conditioning = p.is_using_inpainting_conditioning
 
         self.all_prompts = all_prompts or p.all_prompts or [self.prompt]
@@ -461,7 +553,10 @@ class Processed:
             "batch_size": self.batch_size,
             "restore_faces": self.restore_faces,
             "face_restoration_model": self.face_restoration_model,
+            "sd_model_name": self.sd_model_name,
             "sd_model_hash": self.sd_model_hash,
+            "sd_vae_name": self.sd_vae_name,
+            "sd_vae_hash": self.sd_vae_hash,
             "seed_resize_from_w": self.seed_resize_from_w,
             "seed_resize_from_h": self.seed_resize_from_h,
             "denoising_strength": self.denoising_strength,
@@ -580,10 +675,10 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
         "Seed": p.all_seeds[0] if use_main_prompt else all_seeds[index],
         "Face restoration": opts.face_restoration_model if p.restore_faces else None,
         "Size": f"{p.width}x{p.height}",
-        "Model hash": getattr(p, 'sd_model_hash', None if not opts.add_model_hash_to_info or not shared.sd_model.sd_model_hash else shared.sd_model.sd_model_hash),
-        "Model": (None if not opts.add_model_name_to_info else shared.sd_model.sd_checkpoint_info.name_for_extra),
-        "VAE hash": sd_vae.get_loaded_vae_hash() if opts.add_model_hash_to_info else None,
-        "VAE": sd_vae.get_loaded_vae_name() if opts.add_model_name_to_info else None,
+        "Model hash": p.sd_model_hash if opts.add_model_hash_to_info else None,
+        "Model": p.sd_model_name if opts.add_model_name_to_info else None,
+        "VAE hash": p.sd_vae_hash if opts.add_model_hash_to_info else None,
+        "VAE": p.sd_vae_name if opts.add_model_name_to_info else None,
         "Variation seed": (None if p.subseed_strength == 0 else (p.all_subseeds[0] if use_main_prompt else all_subseeds[index])),
         "Variation seed strength": (None if p.subseed_strength == 0 else p.subseed_strength),
         "Seed resize from": (None if p.seed_resize_from_w <= 0 or p.seed_resize_from_h <= 0 else f"{p.seed_resize_from_w}x{p.seed_resize_from_h}"),
@@ -617,17 +712,14 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
 
     try:
-        # after running refiner, the refiner model is not unloaded - webui swaps back to main model here
-        if shared.sd_model.sd_checkpoint_info.title != opts.sd_model_checkpoint:
-            sd_models.reload_model_weights()
-
         # if no checkpoint override or the override checkpoint can't be found, remove override entry and load opts checkpoint
+        # and if after running refiner, the refiner model is not unloaded - webui swaps back to main model here, if model over is present it will be reloaded afterwards
         if sd_models.checkpoint_aliases.get(p.override_settings.get('sd_model_checkpoint')) is None:
             p.override_settings.pop('sd_model_checkpoint', None)
             sd_models.reload_model_weights()
 
         for k, v in p.override_settings.items():
-            setattr(opts, k, v)
+            opts.set(k, v, is_api=True, run_callbacks=False)
 
             if k == 'sd_model_checkpoint':
                 sd_models.reload_model_weights()
@@ -656,7 +748,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
-    if type(p.prompt) == list:
+    if isinstance(p.prompt, list):
         assert(len(p.prompt) > 0)
     else:
         assert p.prompt is not None
@@ -672,19 +764,27 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     if p.tiling is None:
         p.tiling = opts.tiling
 
+    if p.refiner_checkpoint not in (None, "", "None", "none"):
+        p.refiner_checkpoint_info = sd_models.get_closet_checkpoint_match(p.refiner_checkpoint)
+        if p.refiner_checkpoint_info is None:
+            raise Exception(f'Could not find checkpoint with name {p.refiner_checkpoint}')
+
+    p.sd_model_name = shared.sd_model.sd_checkpoint_info.name_for_extra
+    p.sd_model_hash = shared.sd_model.sd_model_hash
+    p.sd_vae_name = sd_vae.get_loaded_vae_name()
+    p.sd_vae_hash = sd_vae.get_loaded_vae_hash()
+
     modules.sd_hijack.model_hijack.apply_circular(p.tiling)
     modules.sd_hijack.model_hijack.clear_comments()
 
-    comments = {}
-
     p.setup_prompts()
 
-    if type(seed) == list:
+    if isinstance(seed, list):
         p.all_seeds = seed
     else:
         p.all_seeds = [int(seed) + (x if p.subseed_strength == 0 else 0) for x in range(len(p.all_prompts))]
 
-    if type(subseed) == list:
+    if isinstance(subseed, list):
         p.all_subseeds = subseed
     else:
         p.all_subseeds = [int(subseed) + x for x in range(len(p.all_prompts))]
@@ -756,7 +856,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             p.setup_conds()
 
             for comment in model_hijack.comments:
-                comments[comment] = 1
+                p.comment(comment)
 
             p.extra_generation_params.update(model_hijack.extra_generation_params)
 
@@ -885,7 +985,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         images_list=output_images,
         seed=p.all_seeds[0],
         info=infotexts[0],
-        comments="".join(f"{comment}\n" for comment in comments),
         subseed=p.all_subseeds[0],
         index_of_first_image=index_of_first_image,
         infotexts=infotexts,
@@ -909,49 +1008,51 @@ def old_hires_fix_first_pass_dimensions(width, height):
     return width, height
 
 
+@dataclass(repr=False)
 class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
-    sampler = None
+    enable_hr: bool = False
+    denoising_strength: float = 0.75
+    firstphase_width: int = 0
+    firstphase_height: int = 0
+    hr_scale: float = 2.0
+    hr_upscaler: str = None
+    hr_second_pass_steps: int = 0
+    hr_resize_x: int = 0
+    hr_resize_y: int = 0
+    hr_checkpoint_name: str = None
+    hr_sampler_name: str = None
+    hr_prompt: str = ''
+    hr_negative_prompt: str = ''
+
     cached_hr_uc = [None, None]
     cached_hr_c = [None, None]
 
-    def __init__(self, enable_hr: bool = False, denoising_strength: float = 0.75, firstphase_width: int = 0, firstphase_height: int = 0, hr_scale: float = 2.0, hr_upscaler: str = None, hr_second_pass_steps: int = 0, hr_resize_x: int = 0, hr_resize_y: int = 0, hr_checkpoint_name: str = None, hr_sampler_name: str = None, hr_prompt: str = '', hr_negative_prompt: str = '', **kwargs):
-        super().__init__(**kwargs)
-        self.enable_hr = enable_hr
-        self.denoising_strength = denoising_strength
-        self.hr_scale = hr_scale
-        self.hr_upscaler = hr_upscaler
-        self.hr_second_pass_steps = hr_second_pass_steps
-        self.hr_resize_x = hr_resize_x
-        self.hr_resize_y = hr_resize_y
-        self.hr_upscale_to_x = hr_resize_x
-        self.hr_upscale_to_y = hr_resize_y
-        self.hr_checkpoint_name = hr_checkpoint_name
-        self.hr_checkpoint_info = None
-        self.hr_sampler_name = hr_sampler_name
-        self.hr_prompt = hr_prompt
-        self.hr_negative_prompt = hr_negative_prompt
-        self.all_hr_prompts = None
-        self.all_hr_negative_prompts = None
-        self.latent_scale_mode = None
+    hr_checkpoint_info: dict = field(default=None, init=False)
+    hr_upscale_to_x: int = field(default=0, init=False)
+    hr_upscale_to_y: int = field(default=0, init=False)
+    truncate_x: int = field(default=0, init=False)
+    truncate_y: int = field(default=0, init=False)
+    applied_old_hires_behavior_to: tuple = field(default=None, init=False)
+    latent_scale_mode: dict = field(default=None, init=False)
+    hr_c: tuple | None = field(default=None, init=False)
+    hr_uc: tuple | None = field(default=None, init=False)
+    all_hr_prompts: list = field(default=None, init=False)
+    all_hr_negative_prompts: list = field(default=None, init=False)
+    hr_prompts: list = field(default=None, init=False)
+    hr_negative_prompts: list = field(default=None, init=False)
+    hr_extra_network_data: list = field(default=None, init=False)
 
-        if firstphase_width != 0 or firstphase_height != 0:
+    def __post_init__(self):
+        super().__post_init__()
+
+        if self.firstphase_width != 0 or self.firstphase_height != 0:
             self.hr_upscale_to_x = self.width
             self.hr_upscale_to_y = self.height
-            self.width = firstphase_width
-            self.height = firstphase_height
-
-        self.truncate_x = 0
-        self.truncate_y = 0
-        self.applied_old_hires_behavior_to = None
-
-        self.hr_prompts = None
-        self.hr_negative_prompts = None
-        self.hr_extra_network_data = None
+            self.width = self.firstphase_width
+            self.height = self.firstphase_height
 
         self.cached_hr_uc = StableDiffusionProcessingTxt2Img.cached_hr_uc
         self.cached_hr_c = StableDiffusionProcessingTxt2Img.cached_hr_c
-        self.hr_c = None
-        self.hr_uc = None
 
     def calculate_target_resolution(self):
         if opts.use_old_hires_fix_width_height and self.applied_old_hires_behavior_to != (self.width, self.height):
@@ -1061,6 +1162,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             devices.torch_gc()
 
     def sample_hr_pass(self, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts):
+        if shared.state.interrupted:
+            return samples
+
         self.is_hr_pass = True
 
         target_width = self.hr_upscale_to_x
@@ -1145,6 +1249,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio())
 
+        self.sampler = None
+        devices.torch_gc()
+
         decoded_samples = decode_latent_batch(self.sd_model, samples, target_device=devices.cpu, check_for_nans=True)
 
         self.is_hr_pass = False
@@ -1171,12 +1278,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         if self.hr_negative_prompt == '':
             self.hr_negative_prompt = self.negative_prompt
 
-        if type(self.hr_prompt) == list:
+        if isinstance(self.hr_prompt, list):
             self.all_hr_prompts = self.hr_prompt
         else:
             self.all_hr_prompts = self.batch_size * self.n_iter * [self.hr_prompt]
 
-        if type(self.hr_negative_prompt) == list:
+        if isinstance(self.hr_negative_prompt, list):
             self.all_hr_negative_prompts = self.hr_negative_prompt
         else:
             self.all_hr_negative_prompts = self.batch_size * self.n_iter * [self.hr_negative_prompt]
@@ -1191,11 +1298,20 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         hr_prompts = prompt_parser.SdConditioning(self.hr_prompts, width=self.hr_upscale_to_x, height=self.hr_upscale_to_y)
         hr_negative_prompts = prompt_parser.SdConditioning(self.hr_negative_prompts, width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True)
 
-        hires_steps = (self.hr_second_pass_steps or self.steps) * self.step_multiplier
-        self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, hires_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data)
-        self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, self.firstpass_steps, hires_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data)
+        sampler_config = sd_samplers.find_sampler_config(self.hr_sampler_name or self.sampler_name)
+        steps = self.hr_second_pass_steps or self.steps
+        total_steps = sampler_config.total_steps(steps) if sampler_config else steps
+
+        self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data, total_steps)
+        self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, self.firstpass_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data, total_steps)
 
     def setup_conds(self):
+        if self.is_hr_pass:
+            # if we are in hr pass right now, the call is being made from the refiner, and we don't need to setup firstpass cons or switch model
+            self.hr_c = None
+            self.calculate_hr_conds()
+            return
+
         super().setup_conds()
 
         self.hr_uc = None
@@ -1220,7 +1336,6 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         return super().get_conds()
 
-
     def parse_extra_network_prompts(self):
         res = super().parse_extra_network_prompts()
 
@@ -1233,32 +1348,37 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         return res
 
 
+@dataclass(repr=False)
 class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
-    sampler = None
+    init_images: list = None
+    resize_mode: int = 0
+    denoising_strength: float = 0.75
+    image_cfg_scale: float = None
+    mask: Any = None
+    mask_blur_x: int = 4
+    mask_blur_y: int = 4
+    mask_blur: int = None
+    inpainting_fill: int = 0
+    inpaint_full_res: bool = True
+    inpaint_full_res_padding: int = 0
+    inpainting_mask_invert: int = 0
+    initial_noise_multiplier: float = None
+    latent_mask: Image = None
 
-    def __init__(self, init_images: list = None, resize_mode: int = 0, denoising_strength: float = 0.75, image_cfg_scale: float = None, mask: Any = None, mask_blur: int = None, mask_blur_x: int = 4, mask_blur_y: int = 4, inpainting_fill: int = 0, inpaint_full_res: bool = True, inpaint_full_res_padding: int = 0, inpainting_mask_invert: int = 0, initial_noise_multiplier: float = None, **kwargs):
-        super().__init__(**kwargs)
+    image_mask: Any = field(default=None, init=False)
 
-        self.init_images = init_images
-        self.resize_mode: int = resize_mode
-        self.denoising_strength: float = denoising_strength
-        self.image_cfg_scale: float = image_cfg_scale if shared.sd_model.cond_stage_key == "edit" else None
-        self.init_latent = None
-        self.image_mask = mask
-        self.latent_mask = None
-        self.mask_for_overlay = None
-        self.mask_blur_x = mask_blur_x
-        self.mask_blur_y = mask_blur_y
-        if mask_blur is not None:
-            self.mask_blur = mask_blur
-        self.inpainting_fill = inpainting_fill
-        self.inpaint_full_res = inpaint_full_res
-        self.inpaint_full_res_padding = inpaint_full_res_padding
-        self.inpainting_mask_invert = inpainting_mask_invert
-        self.initial_noise_multiplier = opts.initial_noise_multiplier if initial_noise_multiplier is None else initial_noise_multiplier
+    nmask: torch.Tensor = field(default=None, init=False)
+    image_conditioning: torch.Tensor = field(default=None, init=False)
+    init_img_hash: str = field(default=None, init=False)
+    mask_for_overlay: Image = field(default=None, init=False)
+    init_latent: torch.Tensor = field(default=None, init=False)
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.image_mask = self.mask
         self.mask = None
-        self.nmask = None
-        self.image_conditioning = None
+        self.initial_noise_multiplier = opts.initial_noise_multiplier if self.initial_noise_multiplier is None else self.initial_noise_multiplier
 
     @property
     def mask_blur(self):
@@ -1268,22 +1388,22 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
     @mask_blur.setter
     def mask_blur(self, value):
-        self.mask_blur_x = value
-        self.mask_blur_y = value
-
-    @mask_blur.deleter
-    def mask_blur(self):
-        del self.mask_blur_x
-        del self.mask_blur_y
+        if isinstance(value, int):
+            self.mask_blur_x = value
+            self.mask_blur_y = value
 
     def init(self, all_prompts, all_seeds, all_subseeds):
+        self.image_cfg_scale: float = self.image_cfg_scale if shared.sd_model.cond_stage_key == "edit" else None
+
         self.sampler = sd_samplers.create_sampler(self.sampler_name, self.sd_model)
         crop_region = None
 
         image_mask = self.image_mask
 
         if image_mask is not None:
-            image_mask = image_mask.convert('L')
+            # image_mask is passed in as RGBA by Gradio to support alpha masks,
+            # but we still want to support binary masks.
+            image_mask = create_binary_mask(image_mask)
 
             if self.inpainting_mask_invert:
                 image_mask = ImageOps.invert(image_mask)
@@ -1402,7 +1522,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
             elif self.inpainting_fill == 3:
                 self.init_latent = self.init_latent * self.mask
 
-        self.image_conditioning = self.img2img_image_conditioning(image, self.init_latent, image_mask)
+        self.image_conditioning = self.img2img_image_conditioning(image * 2 - 1, self.init_latent, image_mask)
 
     def sample(self, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
         x = self.rng.next()
